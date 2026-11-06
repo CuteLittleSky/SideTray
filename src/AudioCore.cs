@@ -175,9 +175,14 @@ namespace AudioSw
 
         public static string GetDefaultId(ERole role)
         {
+            return GetDefaultId(EDataFlow.eRender, role);
+        }
+
+        public static string GetDefaultId(EDataFlow flow, ERole role)
+        {
             IMMDeviceEnumerator en = CreateEnumerator();
             IMMDevice dev;
-            if (en.GetDefaultAudioEndpoint(EDataFlow.eRender, role, out dev) != 0) return null;
+            if (en.GetDefaultAudioEndpoint(flow, role, out dev) != 0) return null;
             string id;
             dev.GetId(out id);
             Marshal.ReleaseComObject(dev);
@@ -187,12 +192,22 @@ namespace AudioSw
 
         public static List<AudioDeviceInfo> ListRenderDevices(bool includeInactive)
         {
+            return ListDevices(EDataFlow.eRender, includeInactive);
+        }
+
+        public static List<AudioDeviceInfo> ListCaptureDevices(bool includeInactive)
+        {
+            return ListDevices(EDataFlow.eCapture, includeInactive);
+        }
+
+        public static List<AudioDeviceInfo> ListDevices(EDataFlow flow, bool includeInactive)
+        {
             var result = new List<AudioDeviceInfo>();
-            string defId = GetDefaultId(ERole.eMultimedia) ?? GetDefaultId(ERole.eConsole);
+            string defId = GetDefaultId(flow, ERole.eMultimedia) ?? GetDefaultId(flow, ERole.eConsole);
             IMMDeviceEnumerator en = CreateEnumerator();
             IMMDeviceCollection col;
             DEVICE_STATE mask = includeInactive ? DEVICE_STATE.ALL : DEVICE_STATE.ACTIVE;
-            if (en.EnumAudioEndpoints(EDataFlow.eRender, mask, out col) != 0) return result;
+            if (en.EnumAudioEndpoints(flow, mask, out col) != 0) return result;
             int count;
             col.GetCount(out count);
             for (int i = 0; i < count; i++)

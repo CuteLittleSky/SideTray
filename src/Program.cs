@@ -62,6 +62,8 @@ namespace SideTray
         public bool TopMost = true;
         public string Mode = "taskbar";   // taskbar | float
         public bool ShrinkTaskList = false;
+        public bool SwitchInput = true;                 // 切输出时一起切麦克风
+        public List<string[]> Pairs = new List<string[]>();  // 手动配对：{输出名/ID, 输入名/ID}
 
         public static string Dir
         {
@@ -92,6 +94,13 @@ namespace SideTray
                         case "topmost": c.TopMost = v != "0"; break;
                         case "mode": if (v == "float" || v == "taskbar") c.Mode = v; break;
                         case "shrink": c.ShrinkTaskList = v != "0"; break;
+                        case "switchinput": c.SwitchInput = v != "0"; break;
+                        case "pair":
+                            {
+                                var parts = v.Split('|');
+                                if (parts.Length == 2) c.Pairs.Add(new[] { parts[0].Trim(), parts[1].Trim() });
+                            }
+                            break;
                     }
                 }
             }
@@ -111,6 +120,9 @@ namespace SideTray
                 sb.AppendLine("topmost=" + (TopMost ? "1" : "0"));
                 sb.AppendLine("# shrink: 1 = 嵌入时缩窄任务按钮区给它让位（会跟 TrafficMonitor 抢布局，默认 0）");
                 sb.AppendLine("shrink=" + (ShrinkTaskList ? "1" : "0"));
+                sb.AppendLine("# switchinput: 1 = 切换输出设备时把麦克风也切到配对的设备");
+                sb.AppendLine("switchinput=" + (SwitchInput ? "1" : "0"));
+                foreach (var pr in Pairs) sb.AppendLine("pair=" + pr[0] + "|" + pr[1]);
                 sb.AppendLine("x=" + X);
                 sb.AppendLine("y=" + Y);
                 File.WriteAllText(FilePath, sb.ToString(), Encoding.UTF8);
@@ -217,6 +229,7 @@ namespace SideTray
         Config cfg;
         readonly List<AudioDeviceInfo> devices = new List<AudioDeviceInfo>();
         string defaultId;
+        string inputId;
         int volume = -1;
         bool muted;
 
@@ -348,6 +361,8 @@ namespace SideTray
                 string id = AudioCore.GetDefaultId(ERole.eMultimedia) ?? AudioCore.GetDefaultId(ERole.eConsole);
                 int pct; bool m;
                 AudioCore.GetVolume(out pct, out m);
+                inputId = AudioCore.GetDefaultId(EDataFlow.eCapture, ERole.eMultimedia)
+                          ?? AudioCore.GetDefaultId(EDataFlow.eCapture, ERole.eConsole);
                 bool changed = full || id != defaultId || pct != volume || m != muted;
                 defaultId = id;
                 volume = pct;
@@ -401,7 +416,14 @@ namespace SideTray
 
         void UpdateTip()
         {
-            try { tip.SetToolTip(this, TrayText().Replace("\n", " · ")); } catch { }
+            try
+            {
+                string mic = MicShortName();
+                string txt = "副屏任务栏音频控制 · " + CurrentName() + (muted ? "（静音）" : "  " + volume + "%");
+                if (!string.IsNullOrEmpty(mic)) txt += "  ·  麦克风：" + mic;
+                tip.SetToolTip(this, txt);
+            }
+            catch { }
         }
 
         void CycleDevice()
@@ -409,16 +431,113 @@ namespace SideTray
             if (devices.Count < 2) return;
             int idx = devices.FindIndex(d => d.Id == defaultId);
             idx = (idx + 1) % devices.Count;
-            AudioCore.SetDefault(devices[idx].Id, true);
-            Thread.Sleep(120);
-            RefreshAudio(true);
+            SwitchTo(devices[idx]);   // 走同一条路径，才会联动麦克风
         }
 
         void SwitchTo(AudioDeviceInfo d)
         {
             AudioCore.SetDefault(d.Id, true);
             Thread.Sleep(120);
+            if (cfg.SwitchInput)
+            {
+                AudioDeviceInfo mic;
+                string micName = ResolveMic(d.Id, d.Name, out mic);
+                if (mic != null)
+                {
+                    AudioCore.SetDefault(mic.Id, true);
+                    Log.W("SWITCH out=" + d.Name + " -> mic=" + mic.Name);
+                }
+                else Log.W("SWITCH out=" + d.Name + " -> 没找到配对麦克风，输入保持不变");
+            }
             RefreshAudio(true);
+        }
+
+        void SwitchInput(AudioDeviceInfo mic)
+        {
+            AudioCore.SetDefault(mic.Id, true);
+            Thread.Sleep(120);
+            RefreshAudio(true);
+        }
+
+        // "耳机 (HyperX Cloud III)" -> "HyperX Cloud III"（先把 (R)/(TM) 去掉再取括号里）
+        static string Paren(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return "";
+            string s = name.Replace("(R)", "").Replace("(r)", "").Replace("(TM)", "").Replace("(tm)", "");
+            int a = s.IndexOf('('), b = s.IndexOf(')');
+            if (a >= 0 && b > a + 1) return s.Substring(a + 1, b - a - 1);
+            return s;
+        }
+
+        static string Norm(string s)
+        {
+            var sb = new StringBuilder();
+            foreach (var ch in (s ?? "").ToLowerInvariant())
+                if (char.IsLetterOrDigit(ch)) sb.Append(ch);
+            return sb.ToString();
+        }
+
+        static readonly HashSet<string> MicStopWords = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "audio", "device", "interface", "usb", "usb3", "digital", "high", "definition",
+            "realtek", "nvidia", "amd", "intel", "series", "microphone", "mic", "stereo",
+            "音频", "接口", "设备", "数字", "高清晰度"
+        };
+
+        static HashSet<string> Tokens(string s)
+        {
+            var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var w in (s ?? "").Split(new[] { ' ', '-', '_', '/', '\\', ',', '.', '(', ')' }, StringSplitOptions.RemoveEmptyEntries))
+                if (w.Length >= 2) set.Add(w);
+            return set;
+        }
+
+        // 找出跟这台输出设备"同一台硬件"的麦克风：
+        //  1) 配置文件里 pair= 手动指定
+        //  2) 括号里的型号完全一致（Realtek(R) Audio ↔ Realtek(R) Audio）
+        //  3) 型号里有 ≥2 个共同的实词（排除 audio/usb/digital 这类通用词）
+        string ResolveMic(string outId, string outName, out AudioDeviceInfo mic)
+        {
+            mic = null;
+            var caps = AudioCore.ListCaptureDevices(false);
+            if (caps.Count == 0) return null;
+
+            foreach (var rule in cfg.Pairs)
+            {
+                if (EqOrContains(outId, rule[0]) || EqOrContains(outName, rule[0]))
+                    foreach (var c in caps)
+                        if (EqOrContains(c.Id, rule[1]) || EqOrContains(c.Name, rule[1])) { mic = c; return c.Name; }
+            }
+
+            string op = Norm(Paren(outName));
+            if (op.Length >= 3)
+                foreach (var c in caps)
+                    if (Norm(Paren(c.Name)) == op) { mic = c; return c.Name; }
+
+            var ot = Tokens(Paren(outName));
+            int best = 0;
+            foreach (var c in caps)
+            {
+                int score = 0;
+                foreach (var tk in Tokens(Paren(c.Name)))
+                    if (!MicStopWords.Contains(tk) && ot.Contains(tk)) score++;
+                if (score > best) { best = score; mic = c; }
+            }
+            return best >= 2 ? mic.Name : null;
+        }
+
+        static bool EqOrContains(string value, string pattern)
+        {
+            if (string.IsNullOrEmpty(value) || string.IsNullOrEmpty(pattern)) return false;
+            return string.Equals(value, pattern, StringComparison.OrdinalIgnoreCase)
+                || value.IndexOf(pattern, StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        string MicShortName()
+        {
+            foreach (var c in AudioCore.ListCaptureDevices(false))
+                if (c.Id == inputId) return c.Name;
+            return "";
         }
 
         void SetVolumeFromX(int x)
@@ -903,6 +1022,34 @@ namespace SideTray
             var ddm = dev.DropDown as ToolStripDropDownMenu;
             if (ddm != null) ddm.ShowImageMargin = true;
             menu.Items.Add(dev);
+
+            // 输入设备（麦克风）
+            var micMenu = new ToolStripMenuItem("切换输入设备");
+            var caps = AudioCore.ListCaptureDevices(false);
+            foreach (var c in caps)
+            {
+                var info = c;
+                var it = new ToolStripMenuItem(Short(info.Name)) { Checked = info.Id == inputId };
+                it.Click += (s, e) => { try { SwitchInput(info); } catch { } };
+                micMenu.DropDownItems.Add(it);
+            }
+            if (caps.Count == 0)
+                micMenu.DropDownItems.Add(new ToolStripMenuItem("（没有可用输入设备）") { Enabled = false });
+            else
+            {
+                AudioDeviceInfo autoMic = null;
+                ResolveMic(defaultId, CurrentName(), out autoMic);
+                micMenu.DropDownItems.Add(new ToolStripSeparator());
+                micMenu.DropDownItems.Add(new ToolStripMenuItem(
+                    autoMic != null ? "与当前输出配对：" + Short(autoMic.Name) : "与当前输出无配对") { Enabled = false });
+            }
+            var micDdm = micMenu.DropDown as ToolStripDropDownMenu;
+            if (micDdm != null) micDdm.ShowImageMargin = true;
+            menu.Items.Add(micMenu);
+
+            var linkMic = new ToolStripMenuItem("切输出时同时切麦克风") { Checked = cfg.SwitchInput, CheckOnClick = true };
+            linkMic.CheckedChanged += (s, e) => { cfg.SwitchInput = linkMic.Checked; cfg.Save(); };
+            menu.Items.Add(linkMic);
 
             var mute = new ToolStripMenuItem(muted ? "取消静音" : "静音");
             mute.Click += (s, e) => ToggleMute();
