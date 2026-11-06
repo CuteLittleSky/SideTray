@@ -1,0 +1,26 @@
+# ---- 编译产物（程序本体不进仓库）----
+bin/
+obj/
+dist/
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# ---- 打包/发布用 ----
+*.zip
+
+# ---- 本地调试 ----
+*.log
+*.user
+*.cache
+.vs/
+.vscode/
+
+# ---- 截图之类的一次性产物 ----
+screenshots/
+
+# ---- Windows ----
+Thumbs.db
+desktop.ini

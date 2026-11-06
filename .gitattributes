@@ -1,0 +1,17 @@
+# 统一换行，避免 Windows 上改一行整个文件都变
+* text=auto
+
+*.cs      text eol=crlf
+*.ps1     text eol=crlf
+*.csproj  text eol=crlf
+*.manifest text eol=crlf
+*.md      text eol=lf
+*.yml     text eol=lf
+*.json    text eol=lf
+
+*.png     binary
+*.exe     binary
+
+# 许可证原文保持字节不变，不做换行转换
+LICENSE        -text
+LICENSE.GPL-3.0 -text
