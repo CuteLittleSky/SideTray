@@ -268,7 +268,7 @@ namespace SideTray
         public DockForm()
         {
             cfg = Config.Load();
-            SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+            SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.ResizeRedraw | ControlStyles.Opaque, true);
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.Manual;
@@ -567,6 +567,12 @@ namespace SideTray
         }
 
         // ---------------- 绘制 ----------------
+        // 背景完全由 OnPaint 自己铺（嵌入时是任务栏底图、浮动时是渐变卡片），
+        // 这里禁掉默认背景擦除，否则悬停重绘时会先糊一层 BackColor（近黑）——就是用户看到的“黑一下”。
+        protected override void OnPaintBackground(PaintEventArgs e)
+        {
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
             var g = e.Graphics;
@@ -584,13 +590,6 @@ namespace SideTray
                     g.InterpolationMode = oldInterp;
                 }
                 else using (var b = new SolidBrush(barBg)) g.FillRectangle(b, full);
-                if (hoverZone == ZoneName)
-                {
-                    using (var p = Ui.Round(RName, 4))
-                    using (var b = new SolidBrush(barText.A > 100 && barBg.GetBrightness() > 0.6f
-                        ? Color.FromArgb(26, 0, 0, 0) : Color.FromArgb(26, 255, 255, 255)))
-                        g.FillPath(b, p);
-                }
             }
             else
             {
@@ -599,12 +598,6 @@ namespace SideTray
                     using (var bg = new LinearGradientBrush(full, Color.FromArgb(34, 34, 40), Ui.Bg, LinearGradientMode.Vertical))
                         g.FillPath(bg, path);
                     using (var pen = new Pen(Ui.Border, 1f)) g.DrawPath(pen, path);
-                }
-                if (hoverZone == ZoneName)
-                {
-                    using (var p = Ui.Round(RName, 6))
-                    using (var b = new SolidBrush(Color.FromArgb(30, 90, 170, 255)))
-                        g.FillPath(b, p);
                 }
             }
 
@@ -712,7 +705,7 @@ namespace SideTray
         void OnMove(object s, MouseEventArgs e)
         {
             int z = HitTest(e.Location);
-            if (z != hoverZone) { hoverZone = z; Invalidate(); }
+            hoverZone = z;   // 仅记录光标所在区域；悬停不再触发重绘，彻底避免悬停时的任何闪动/高亮
             if (embedded) Cursor = (z == ZoneSlider) ? Cursors.SizeWE : (z >= 0 ? Cursors.Hand : Cursors.Default);
             else Cursor = (z == ZoneName || z == ZoneIcon) ? Cursors.Hand : (z == ZoneSlider ? Cursors.SizeWE : Cursors.SizeAll);
 
