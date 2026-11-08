@@ -63,6 +63,7 @@ namespace SideTray
         public string Mode = "taskbar";   // taskbar | float
         public bool ShrinkTaskList = false;
         public bool SwitchInput = true;                 // 切输出时一起切麦克风
+        public string BgColor = "";                      // 上次采到的任务栏颜色 "r,g,b"，冷启动兜底
         public List<string[]> Pairs = new List<string[]>();  // 手动配对：{输出名/ID, 输入名/ID}
 
         public static string Dir
@@ -95,6 +96,7 @@ namespace SideTray
                         case "mode": if (v == "float" || v == "taskbar") c.Mode = v; break;
                         case "shrink": c.ShrinkTaskList = v != "0"; break;
                         case "switchinput": c.SwitchInput = v != "0"; break;
+                        case "bgcolor": c.BgColor = v; break;
                         case "pair":
                             {
                                 var parts = v.Split('|');
@@ -122,6 +124,7 @@ namespace SideTray
                 sb.AppendLine("shrink=" + (ShrinkTaskList ? "1" : "0"));
                 sb.AppendLine("# switchinput: 1 = 切换输出设备时把麦克风也切到配对的设备");
                 sb.AppendLine("switchinput=" + (SwitchInput ? "1" : "0"));
+                if (!string.IsNullOrEmpty(BgColor)) sb.AppendLine("bgcolor=" + BgColor);
                 foreach (var pr in Pairs) sb.AppendLine("pair=" + pr[0] + "|" + pr[1]);
                 sb.AppendLine("x=" + X);
                 sb.AppendLine("y=" + Y);
@@ -250,6 +253,8 @@ namespace SideTray
         Rectangle floatBounds;
         Color barBg = Ui.Bg, barText = Ui.Text, barDim = Ui.Dim, barAccent = Ui.Accent;
         Bitmap embedBg;
+        bool needBg;
+        int bgMiss;
         int embedFailures;
 
         ToolTip tip = new ToolTip();
@@ -277,6 +282,7 @@ namespace SideTray
             ClientSize = new Size(FW, FH);
             ComputeLayout();
 
+            ApplySavedColors();   // 冷启动先用上次记住的任务栏颜色，避免第一帧闪一下黑
             RefreshAudio(true);
             BuildTray();
 
@@ -350,7 +356,13 @@ namespace SideTray
         {
             if (!IsHandleCreated) return;
             RefreshAudio(false);
-            if (embedded) { EnsureEmbedded(); if (++tickCount % 4 == 0) RepositionIfNeeded(); }
+            if (embedded)
+            {
+                EnsureEmbedded();
+                if (++tickCount % 4 == 0) RepositionIfNeeded();
+                if (needBg) { if (bgMiss < 40) ResampleBg(); }          // 截屏失败：每 1.5 秒重试，最多 1 分钟
+                else if (tickCount % 40 == 0) ValidateBg();             // 每 60 秒核对一次任务栏颜色
+            }
             else if (cfg.Mode == "taskbar" && embedFailures < 12 && Native.IsWindowVisible(Handle)) EmbedNow();
         }
 
@@ -564,7 +576,14 @@ namespace SideTray
             var full = new Rectangle(0, 0, Width - 1, Height - 1);
             if (embedded)
             {
-                if (embedBg != null) g.DrawImage(embedBg, new Rectangle(0, 0, Width, Height)); else using (var b = new SolidBrush(barBg)) g.FillRectangle(b, full);
+                if (embedBg != null)
+                {
+                    var oldInterp = g.InterpolationMode;
+                    if (embedBg.Height != Height) g.InterpolationMode = InterpolationMode.HighQualityBilinear;
+                    g.DrawImage(embedBg, new Rectangle(0, 0, Width, Height));
+                    g.InterpolationMode = oldInterp;
+                }
+                else using (var b = new SolidBrush(barBg)) g.FillRectangle(b, full);
                 if (hoverZone == ZoneName)
                 {
                     using (var p = Ui.Round(RName, 4))
@@ -759,7 +778,7 @@ namespace SideTray
             // 先按目标位置截一张任务栏底图，嵌进去后拿它当背景，和任务栏无缝
             int xScreen = limitLeft - EW - 8;
             int yScreen = tbRect.Top + (tbRect.Bottom - tbRect.Top - EH) / 2;
-            CaptureTaskbarBg(tbRect, xScreen, yScreen);
+            CaptureTaskbarBg(tbRect, xScreen, yScreen, !embedded);
 
             // 藏掉浮动模式的圆角/尺寸，切成子窗口
             embedded = true;
@@ -829,7 +848,7 @@ namespace SideTray
             Native.ScreenToClient(tbHost, ref pt);
             if (Math.Abs(pt.X - lastPlaced.X) < 4 && Math.Abs(pt.Y - lastPlaced.Y) < 4) return;
 
-            CaptureTaskbarBg(tbRect, xScreen, yScreen);
+            CaptureTaskbarBg(tbRect, xScreen, yScreen, !embedded);
             Native.SetWindowPos(Handle, IntPtr.Zero, pt.X, pt.Y, EW, EH, 0x0004 | 0x0010 | 0x0200);
             lastPlaced = pt;
             Log.W("EMBED reposition -> " + pt.X + "," + pt.Y + " limitLeft=" + limit);
@@ -937,38 +956,134 @@ namespace SideTray
             }
         }
 
-        void CaptureTaskbarBg(Native.RECT tbRect, int x, int y)
+        /// <summary>采样任务栏外观当底图；截屏失败（锁屏 / DWM 未就绪时会返回全黑）就退回上次记住的颜色</summary>
+        void CaptureTaskbarBg(Native.RECT tbRect, int x, int y, bool allowFull)
         {
             try
             {
-                if (embedBg != null) { embedBg.Dispose(); embedBg = null; }
-                // 只取任务栏顶部一条像素横条，避免把旁边按钮/其它小工具"拍"进底图
-                var shot = new Bitmap(EW, EH);
-                using (var g = Graphics.FromImage(shot))
-                    g.CopyFromScreen(x, y, 0, 0, new Size(EW, EH));
+                Bitmap shot = null;
+                if (allowFull)
+                {
+                    var b1 = new Bitmap(EW, EH);
+                    using (var g1 = Graphics.FromImage(b1))
+                        g1.CopyFromScreen(x, y, 0, 0, new Size(EW, EH));
+                    if (IsBlack(b1)) b1.Dispose(); else shot = b1;
+                }
+                if (shot == null)
+                {
+                    // 只取窗口正上方那条纯任务栏像素，绝不会把我们自己拍进去
+                    var b2 = new Bitmap(EW, 1);
+                    using (var g2 = Graphics.FromImage(b2))
+                        g2.CopyFromScreen(x, tbRect.Top + 5, 0, 0, new Size(EW, 1));
+                    if (IsBlack(b2)) b2.Dispose(); else shot = b2;
+                }
+                if (shot == null)
+                {
+                    needBg = true;
+                    bgMiss++;
+                    Log.W("BG 采样是全黑（第 " + bgMiss + " 次），先用上次颜色");
+                    ApplySavedColors();
+                    return;
+                }
+
+                if (embedBg != null) embedBg.Dispose();
                 embedBg = shot;
+                needBg = false;
+                bgMiss = 0;
 
                 long r = 0, gg = 0, b = 0;
                 int n = 0;
-                for (int py = 2; py < EH; py += 6)
-                    for (int px = 0; px < EW; px += 8)
+                int stepY = Math.Max(1, shot.Height / 6);
+                for (int py = 0; py < shot.Height; py += stepY)
+                    for (int px = 0; px < shot.Width; px += 8)
                     {
                         var c = shot.GetPixel(px, py);
                         r += c.R; gg += c.G; b += c.B; n++;
                     }
                 var avg = Color.FromArgb((int)(r / n), (int)(gg / n), (int)(b / n));
-                barBg = avg;
-                bool light = avg.GetBrightness() > 0.6f;
-                barText = light ? Color.FromArgb(28, 28, 32) : Color.FromArgb(236, 236, 242);
-                barDim = light ? Color.FromArgb(96, 96, 104) : Color.FromArgb(152, 152, 164);
-                barAccent = light ? Color.FromArgb(0, 96, 190) : Color.FromArgb(96, 176, 255);
-                Log.W("EMBED bg avg=" + avg.R + "," + avg.G + "," + avg.B + " light=" + light);
+                SetLookFromColor(avg);
+
+                string rgb = avg.R + "," + avg.G + "," + avg.B;
+                if (cfg.BgColor != rgb) { cfg.BgColor = rgb; cfg.Save(); }   // 记住，冷启动兜底
+                Log.W("EMBED bg avg=" + rgb + " light=" + (avg.GetBrightness() > 0.6f));
             }
-            catch
+            catch (Exception ex)
             {
                 embedBg = null;
-                barBg = Ui.Bg; barText = Ui.Text; barDim = Ui.Dim; barAccent = Ui.Accent;
+                needBg = true;
+                bgMiss++;
+                ApplySavedColors();
+                Log.W("BG 采样异常: " + ex.Message);
             }
+        }
+
+        static bool IsBlack(Bitmap b)
+        {
+            int stepY = Math.Max(1, b.Height / 6), stepX = Math.Max(1, b.Width / 8);
+            for (int yy = 0; yy < b.Height; yy += stepY)
+                for (int xx = 0; xx < b.Width; xx += stepX)
+                {
+                    var c = b.GetPixel(xx, yy);
+                    if (c.R > 4 || c.G > 4 || c.B > 4) return false;
+                }
+            return true;
+        }
+
+        void SetLookFromColor(Color avg)
+        {
+            barBg = avg;
+            bool light = avg.GetBrightness() > 0.6f;
+            barText = light ? Color.FromArgb(28, 28, 32) : Color.FromArgb(236, 236, 242);
+            barDim = light ? Color.FromArgb(96, 96, 104) : Color.FromArgb(152, 152, 164);
+            barAccent = light ? Color.FromArgb(0, 96, 190) : Color.FromArgb(96, 176, 255);
+        }
+
+        void ApplySavedColors()
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(cfg.BgColor)) { barBg = Ui.Bg; barText = Ui.Text; barDim = Ui.Dim; barAccent = Ui.Accent; return; }
+                var parts = cfg.BgColor.Split(',');
+                SetLookFromColor(Color.FromArgb(int.Parse(parts[0]), int.Parse(parts[1]), int.Parse(parts[2])));
+            }
+            catch { barBg = Ui.Bg; barText = Ui.Text; barDim = Ui.Dim; barAccent = Ui.Accent; }
+        }
+
+        // 已嵌入时重采一次（只取窗口上方那条安全像素）
+        void ResampleBg()
+        {
+            if (!embedded || tbTaskbar == IntPtr.Zero || tbHost == IntPtr.Zero || !IsHandleCreated) return;
+            Native.RECT tbRect;
+            Native.GetWindowRect(tbTaskbar, out tbRect);
+            var p0 = new Point(lastPlaced.X, lastPlaced.Y);
+            Native.ClientToScreen(tbHost, ref p0);
+            CaptureTaskbarBg(tbRect, p0.X, p0.Y, false);
+            Invalidate();
+        }
+
+        // 每 60 秒核对任务栏实际颜色，偏差大就重采（换主题 / 换壁纸后自愈）
+        void ValidateBg()
+        {
+            if (!embedded || tbTaskbar == IntPtr.Zero || tbHost == IntPtr.Zero) return;
+            try
+            {
+                Native.RECT tbRect;
+                Native.GetWindowRect(tbTaskbar, out tbRect);
+                var p0 = new Point(lastPlaced.X, lastPlaced.Y);
+                Native.ClientToScreen(tbHost, ref p0);
+                using (var bmp = new Bitmap(1, 1))
+                {
+                    using (var g = Graphics.FromImage(bmp))
+                        g.CopyFromScreen(p0.X + EW / 2, tbRect.Top + 5, 0, 0, new Size(1, 1));
+                    var c = bmp.GetPixel(0, 0);
+                    if (Math.Abs(c.R - barBg.R) > 40 || Math.Abs(c.G - barBg.G) > 40 || Math.Abs(c.B - barBg.B) > 40)
+                    {
+                        Log.W("BG 偏差过大，重采: " + barBg.R + "," + barBg.G + "," + barBg.B + " -> " + c.R + "," + c.G + "," + c.B);
+                        ResampleBg();
+                    }
+                }
+            }
+            catch { }
         }
 
         // ---------------- 菜单 ----------------
@@ -1063,6 +1178,11 @@ namespace SideTray
             place.DropDownItems.Add(inBar);
             place.DropDownItems.Add(flt);
             menu.Items.Add(place);
+
+            var resample = new ToolStripMenuItem("重新采样背景（换主题/壁纸后用）");
+            resample.Click += (s, e) => { if (embedded) ResampleBg(); else { /* 浮动模式没有底图 */ } };
+            resample.Enabled = embedded;
+            menu.Items.Add(resample);
 
             var toggle = new ToolStripMenuItem("隐藏面板") { ShortcutKeyDisplayString = "Ctrl+Alt+A" };
             toggle.Click += (s, e) => { Hide(); };
@@ -1287,6 +1407,7 @@ namespace SideTray
         [DllImport("user32.dll", EntryPoint = "SetWindowLongPtr")] public static extern IntPtr SetWindowLongPtr(IntPtr h, int idx, IntPtr val);
         [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
         [DllImport("user32.dll")] public static extern bool ScreenToClient(IntPtr h, ref Point p);
+        [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref Point p);
         [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr h);
         [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr h, int id, uint mod, uint vk);
         [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr h, int id);
