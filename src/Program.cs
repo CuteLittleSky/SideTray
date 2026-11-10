@@ -254,7 +254,9 @@ namespace SideTray
         Rectangle floatBounds;
         Color barBg = Ui.Bg, barText = Ui.Text, barDim = Ui.Dim, barAccent = Ui.Accent;
         Bitmap embedBg;
-        bool layeredOk = true;   // 分层透明是否可用（不可用就退回截底图）
+        bool layeredOk = true;
+        int lastLayerLogTick;
+        int lastPaintLogTick;   // 分层透明是否可用（不可用就退回截底图）
         bool needBg;
         int bgMiss;
         int embedFailures;
@@ -387,7 +389,7 @@ namespace SideTray
                 {
                     UpdateTip();
                     if (tray != null) tray.Text = TrayText();
-                    Invalidate();
+                    UpdateNow(); Invalidate();
                 }
             }
             catch { }
@@ -588,6 +590,7 @@ namespace SideTray
 
         protected override void OnPaint(PaintEventArgs e)
         {
+            
             if (layeredOk)
             {
                 try { PaintLayered(); return; }
@@ -604,6 +607,15 @@ namespace SideTray
         void PaintLayered()
         {
             using (var bmp = RenderBitmap()) PushLayered(bmp);
+        }
+
+        // 状态变了就主动推一帧（子窗口在某些情况下收不到 WM_PAINT，只靠 Invalidate 会一直不显示）
+        void UpdateNow()
+        {
+            if (!IsHandleCreated) return;
+            if (!layeredOk) { Invalidate(); return; }
+            try { PaintLayered(); }
+            catch (Exception ex) { layeredOk = false; Log.W("LAYERED 失败，退回底图方案: " + ex.Message); Invalidate(); }
         }
 
         Bitmap RenderBitmap()
@@ -638,15 +650,63 @@ namespace SideTray
             catch (Exception ex) { Log.W("SNAPSHOT 失败 " + ex.Message); }
         }
 
+        // 自己建 DIB 并拷「预乘 alpha」的像素。
+        // 不能用 bmp.GetHbitmap()——它会把 alpha 通道摊平，结果就是「窗口看不见但能点」。
         void PushLayered(Bitmap bmp)
         {
+            int w = bmp.Width, h = bmp.Height;
             IntPtr screenDc = Native.GetDC(IntPtr.Zero);
             IntPtr memDc = Native.CreateCompatibleDC(screenDc);
-            IntPtr hBmp = bmp.GetHbitmap(Color.FromArgb(0));
-            IntPtr oldBmp = Native.SelectObject(memDc, hBmp);
+            IntPtr hBmp = IntPtr.Zero, oldBmp = IntPtr.Zero, bits = IntPtr.Zero;
             try
             {
-                var size = new Native.SIZE { cx = bmp.Width, cy = bmp.Height };
+                var bmi = new Native.BITMAPINFO();
+                bmi.bmiHeader.biSize = Marshal.SizeOf(typeof(Native.BITMAPINFOHEADER));
+                bmi.bmiHeader.biWidth = w;
+                bmi.bmiHeader.biHeight = -h;      // 负数 = 自上而下
+                bmi.bmiHeader.biPlanes = 1;
+                bmi.bmiHeader.biBitCount = 32;
+                bmi.bmiHeader.biCompression = 0;  // BI_RGB
+
+                hBmp = Native.CreateDIBSection(screenDc, ref bmi, 0, out bits, IntPtr.Zero, 0);
+                if (hBmp == IntPtr.Zero || bits == IntPtr.Zero) throw new Exception("CreateDIBSection 失败");
+
+                int maxAOut = 0, solidOut = 0;
+                var data = bmp.LockBits(new Rectangle(0, 0, w, h), System.Drawing.Imaging.ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+                try
+                {
+                    int stride = data.Stride;
+                    var row = new byte[Math.Abs(stride)];
+                    var outRow = new byte[w * 4];
+                    
+                    for (int y = 0; y < h; y++)
+                    {
+                        Marshal.Copy(new IntPtr(data.Scan0.ToInt64() + (long)y * stride), row, 0, row.Length);
+                        for (int x = 0; x < w; x++)
+                        {
+                            byte b = row[x * 4], g2 = row[x * 4 + 1], r = row[x * 4 + 2], a = row[x * 4 + 3];
+                            // 预乘：颜色 * alpha / 255（UpdateLayeredWindow 要的就是这个）
+                            outRow[x * 4] = (byte)(b * a / 255);
+                            outRow[x * 4 + 1] = (byte)(g2 * a / 255);
+                            outRow[x * 4 + 2] = (byte)(r * a / 255);
+                            outRow[x * 4 + 3] = a;
+                            if (a > maxAOut) maxAOut = a;
+                            if (a >= 200) solidOut++;
+                        }
+                        Marshal.Copy(outRow, 0, new IntPtr(bits.ToInt64() + (long)y * w * 4), outRow.Length);
+                    }
+                }
+                finally { bmp.UnlockBits(data); }
+
+                // 诊断：alpha 全 0 的话窗口就会「看不见但能点到」
+                if (Environment.TickCount - lastLayerLogTick > 60000)
+                {
+                    Log.W("LAYERED " + w + "x" + h + " maxAlpha=" + maxAOut + " solidPx=" + solidOut);
+                    lastLayerLogTick = Environment.TickCount;
+                }
+
+                oldBmp = Native.SelectObject(memDc, hBmp);
+                var size = new Native.SIZE { cx = w, cy = h };
                 var src = new Point(0, 0);
                 var blend = new Native.BLENDFUNCTION { BlendOp = 0, BlendFlags = 0, SourceConstantAlpha = 255, AlphaFormat = 1 };
                 if (!Native.UpdateLayeredWindow(Handle, screenDc, IntPtr.Zero, ref size, memDc, ref src, 0, ref blend, 2))
@@ -654,8 +714,8 @@ namespace SideTray
             }
             finally
             {
-                Native.SelectObject(memDc, oldBmp);
-                Native.DeleteObject(hBmp);
+                if (oldBmp != IntPtr.Zero) Native.SelectObject(memDc, oldBmp);
+                if (hBmp != IntPtr.Zero) Native.DeleteObject(hBmp);
                 Native.DeleteDC(memDc);
                 Native.ReleaseDC(IntPtr.Zero, screenDc);
             }
@@ -933,7 +993,7 @@ namespace SideTray
             if (cfg.ShrinkTaskList) ShrinkTaskList(host, pt.X);
             embedFailures = 0;
             Log.W("EMBED ok host=" + Native.ClassOf(host) + " at " + pt.X + "," + pt.Y + " limitLeft=" + limitLeft + " wasVisible=" + wasVisible);
-            Invalidate();
+            UpdateNow(); Invalidate();
         }
 
         // 任务栏右侧已有小工具（TrafficMonitor 等）或时钟的最左边缘，屏幕坐标
@@ -981,7 +1041,7 @@ namespace SideTray
             Native.SetWindowPos(Handle, IntPtr.Zero, pt.X, pt.Y, EW, EH, 0x0004 | 0x0010 | 0x0200);
             lastPlaced = pt;
             Log.W("EMBED reposition -> " + pt.X + "," + pt.Y + " limitLeft=" + limit);
-            Invalidate();
+            UpdateNow(); Invalidate();
         }
 
         void ShrinkTaskList(IntPtr host, int ourX)
@@ -1561,6 +1621,30 @@ namespace SideTray
         [DllImport("gdi32.dll")] public static extern bool DeleteDC(IntPtr hdc);
         [DllImport("gdi32.dll")] public static extern IntPtr SelectObject(IntPtr hdc, IntPtr h);
         [DllImport("gdi32.dll")] public static extern bool DeleteObject(IntPtr hObject);
+        [DllImport("gdi32.dll")] public static extern IntPtr CreateDIBSection(IntPtr hdc, ref BITMAPINFO pbmi, uint usage, out IntPtr ppvBits, IntPtr hSection, uint offset);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct BITMAPINFOHEADER
+        {
+            public int biSize;
+            public int biWidth;
+            public int biHeight;
+            public short biPlanes;
+            public short biBitCount;
+            public int biCompression;
+            public int biSizeImage;
+            public int biXPelsPerMeter;
+            public int biYPelsPerMeter;
+            public int biClrUsed;
+            public int biClrImportant;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct BITMAPINFO
+        {
+            public BITMAPINFOHEADER bmiHeader;
+            public int bmiColors;
+        }
         [DllImport("user32.dll", SetLastError = true)]
         public static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst, IntPtr pptDst, ref SIZE psize,
             IntPtr hdcSrc, ref Point pptSrc, int crKey, ref BLENDFUNCTION pblend, int dwFlags);
