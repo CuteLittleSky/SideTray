@@ -225,6 +225,7 @@ namespace SideTray
         const int HOTKEY_TOGGLE = 1;
         const int HOTKEY_CYCLE = 2;
         const int HOTKEY_MODE = 3;
+        const int HOTKEY_SNAP = 4;
 
         const int FW = 424, FH = 50;    // 浮动模式尺寸
         const int EW = 248, EH = 40;    // 嵌入任务栏尺寸
@@ -253,6 +254,7 @@ namespace SideTray
         Rectangle floatBounds;
         Color barBg = Ui.Bg, barText = Ui.Text, barDim = Ui.Dim, barAccent = Ui.Accent;
         Bitmap embedBg;
+        bool layeredOk = true;   // 分层透明是否可用（不可用就退回截底图）
         bool needBg;
         int bgMiss;
         int embedFailures;
@@ -347,8 +349,7 @@ namespace SideTray
         {
             base.OnResize(e);
             ComputeLayout();
-            if (embedded) { Region = null; }
-            else using (var p = Ui.Round(new Rectangle(0, 0, Width, Height), 13)) Region = new Region(p);
+            Region = null;   // 圆角靠分层透明的逐像素 alpha 画，不用 Region 剪裁
         }
 
         // ---------------- 音频 ----------------
@@ -360,7 +361,8 @@ namespace SideTray
             {
                 EnsureEmbedded();
                 if (++tickCount % 4 == 0) RepositionIfNeeded();
-                if (needBg) { if (bgMiss < 40) ResampleBg(); }          // 截屏失败：每 1.5 秒重试，最多 1 分钟
+                if (layeredOk) { /* 分层透明模式下不需要底图 */ }
+                else if (needBg) { if (bgMiss < 40) ResampleBg(); }          // 截屏失败：每 1.5 秒重试，最多 1 分钟
                 else if (tickCount % 40 == 0) ValidateBg();             // 每 60 秒核对一次任务栏颜色
             }
             else if (cfg.Mode == "taskbar" && embedFailures < 12 && Native.IsWindowVisible(Handle)) EmbedNow();
@@ -573,9 +575,106 @@ namespace SideTray
         {
         }
 
+        // 分层窗口（Win8+ 开始支持给子窗口用），才能做到「底色完全透出任务栏」
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                var cp = base.CreateParams;
+                cp.ExStyle |= 0x00080000;   // WS_EX_LAYERED
+                return cp;
+            }
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
-            var g = e.Graphics;
+            if (layeredOk)
+            {
+                try { PaintLayered(); return; }
+                catch (Exception ex)
+                {
+                    layeredOk = false;
+                    Log.W("LAYERED 失败，退回底图方案: " + ex.Message);
+                }
+            }
+            PaintOpaque(e.Graphics);
+        }
+
+        // 只画图标/文字/滑条，背景逐像素透明——和 TrafficMonitor 一样的做法
+        void PaintLayered()
+        {
+            using (var bmp = RenderBitmap()) PushLayered(bmp);
+        }
+
+        Bitmap RenderBitmap()
+        {
+            var bmp = new Bitmap(Math.Max(1, Width), Math.Max(1, Height), System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.Clear(Color.Transparent);
+                // 关键：分层窗口里 alpha=0 的区域会被「点穿」到任务栏，
+                // 所以整块垫一层 alpha=1 的底色（肉眼看不见），保证整条都能点
+                using (var hit = new SolidBrush(Color.FromArgb(1, 0, 0, 0)))
+                    g.FillRectangle(hit, 0, 0, bmp.Width, bmp.Height);
+
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
+                if (!embedded) DrawFloatPanel(g);
+                PaintContent(g, embedded);
+            }
+            return bmp;
+        }
+
+        // 调试用：把实际渲染的画面存成 PNG（带 alpha），方便不看屏幕也能确认长什么样
+        public void SaveSnapshot()
+        {
+            try
+            {
+                string path = Path.Combine(Config.Dir, "snapshot.png");
+                using (var bmp = RenderBitmap())
+                    bmp.Save(path, System.Drawing.Imaging.ImageFormat.Png);   // 带 alpha，便于检查哪些是透明的
+                Log.W("SNAPSHOT " + path);
+            }
+            catch (Exception ex) { Log.W("SNAPSHOT 失败 " + ex.Message); }
+        }
+
+        void PushLayered(Bitmap bmp)
+        {
+            IntPtr screenDc = Native.GetDC(IntPtr.Zero);
+            IntPtr memDc = Native.CreateCompatibleDC(screenDc);
+            IntPtr hBmp = bmp.GetHbitmap(Color.FromArgb(0));
+            IntPtr oldBmp = Native.SelectObject(memDc, hBmp);
+            try
+            {
+                var size = new Native.SIZE { cx = bmp.Width, cy = bmp.Height };
+                var src = new Point(0, 0);
+                var blend = new Native.BLENDFUNCTION { BlendOp = 0, BlendFlags = 0, SourceConstantAlpha = 255, AlphaFormat = 1 };
+                if (!Native.UpdateLayeredWindow(Handle, screenDc, IntPtr.Zero, ref size, memDc, ref src, 0, ref blend, 2))
+                    throw new Exception("UpdateLayeredWindow 返回 false, err=" + Marshal.GetLastWin32Error());
+            }
+            finally
+            {
+                Native.SelectObject(memDc, oldBmp);
+                Native.DeleteObject(hBmp);
+                Native.DeleteDC(memDc);
+                Native.ReleaseDC(IntPtr.Zero, screenDc);
+            }
+        }
+
+        void DrawFloatPanel(Graphics g)
+        {
+            var full = new Rectangle(0, 0, Width - 1, Height - 1);
+            using (var path = Ui.Round(full, 13))
+            {
+                using (var bg = new LinearGradientBrush(full, Color.FromArgb(34, 34, 40), Ui.Bg, LinearGradientMode.Vertical))
+                    g.FillPath(bg, path);
+                using (var pen = new Pen(Ui.Border, 1f)) g.DrawPath(pen, path);
+            }
+        }
+
+        // 兜底：分层不可用时回到「截任务栏底图」那套
+        void PaintOpaque(Graphics g)
+        {
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
 
@@ -591,23 +690,26 @@ namespace SideTray
                 }
                 else using (var b = new SolidBrush(barBg)) g.FillRectangle(b, full);
             }
-            else
-            {
-                using (var path = Ui.Round(full, 13))
-                {
-                    using (var bg = new LinearGradientBrush(full, Color.FromArgb(34, 34, 40), Ui.Bg, LinearGradientMode.Vertical))
-                        g.FillPath(bg, path);
-                    using (var pen = new Pen(Ui.Border, 1f)) g.DrawPath(pen, path);
-                }
-            }
+            else DrawFloatPanel(g);
 
-            var textC = embedded ? barText : Ui.Text;
-            var dimC = embedded ? barDim : Ui.Dim;
-            var accentC = embedded ? barAccent : Ui.Accent;
+            PaintContent(g, false);
+        }
+
+        void PaintContent(Graphics g, bool transparent)
+        {
+            // 嵌入任务栏时用「白字 + 深色描边」：不管任务栏是浅色、深色还是壁纸透出来的，
+            // 都能看清；也因此完全不依赖截屏取色（截屏在某些远程/多屏环境下拿到的是别的画面）
+            var textC = embedded ? Color.White : Ui.Text;
+            var dimC = embedded ? Color.FromArgb(232, 232, 240) : Ui.Dim;
+            var accentC = embedded ? Color.FromArgb(126, 200, 255) : Ui.Accent;
+            var shadowC = Color.FromArgb(175, 0, 0, 0);
             var fontMain = embedded ? Ui.FontCompact : Ui.FontMain;
             var fontSmall = embedded ? Ui.FontTiny : Ui.FontSmall;
 
-            Ui.Speaker(g, RIcon, muted, muted ? Color.FromArgb(240, 120, 120) : textC);
+            // 悬停不画任何高亮（按之前那次修复的结论：高亮方块看着脏，只改光标形状）
+
+
+            Ui.Speaker(g, RIcon, muted, muted ? Color.FromArgb(255, 138, 138) : textC);
 
             // 设备名
             float nameX = RName.X + 4;
@@ -615,10 +717,12 @@ namespace SideTray
             using (var sfTrim = new StringFormat { LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap })
             using (var sfPlain = new StringFormat { LineAlignment = StringAlignment.Center, FormatFlags = StringFormatFlags.NoWrap })
             {
-                if (embedded)
+                if (embedded || transparent)
                 {
-                    using (var b = new SolidBrush(textC))
-                        g.DrawString(ShortName(), fontMain, b, new RectangleF(nameX, RName.Y, availW, RName.Height), sfTrim);
+                    var rectName = new RectangleF(nameX, RName.Y, availW, RName.Height);
+                    string shortName = ShortName();
+                    if (transparent) DrawShadowedText(g, shortName, fontMain, textC, shadowC, rectName, sfTrim);
+                    else using (var b = new SolidBrush(textC)) g.DrawString(shortName, fontMain, b, rectName, sfTrim);
                 }
                 else
                 {
@@ -655,23 +759,55 @@ namespace SideTray
             int tl = RSlider.Left + 5, tr = RSlider.Right - 5;
             float thick = embedded ? 3f : 4f;
             float knobR = embedded ? 4.5f : 5f;
-            using (var tb = new Pen(embedded ? Color.FromArgb(110, dimC) : Ui.Track, thick) { StartCap = LineCap.Round, EndCap = LineCap.Round })
-                g.DrawLine(tb, tl, cy, tr, cy);
             int pctShown = Math.Max(0, Math.Min(100, volume));
             int kx = tl + (int)Math.Round((tr - tl) * (pctShown / 100.0));
+
+            if (transparent)
+            {
+                // 深浅两层，保证在任何壁纸/任务栏颜色上都看得见
+                using (var under = new Pen(Color.FromArgb(80, 0, 0, 0), thick + 2.5f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                    g.DrawLine(under, tl, cy, tr, cy);
+                using (var baseTrack = new Pen(Color.FromArgb(225, dimC), thick) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                    g.DrawLine(baseTrack, tl, cy, tr, cy);
+            }
+            else
+            {
+                using (var tb = new Pen(embedded ? Color.FromArgb(110, dimC) : Ui.Track, thick) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                    g.DrawLine(tb, tl, cy, tr, cy);
+            }
+
             if (!muted && pctShown > 0)
                 using (var ab = new Pen(accentC, thick) { StartCap = LineCap.Round, EndCap = LineCap.Round })
                     g.DrawLine(ab, tl, cy, kx, cy);
-            using (var kb = new SolidBrush(muted ? Color.FromArgb(150, 150, 160) : accentC))
+            using (var kb = new SolidBrush(muted ? Color.FromArgb(160, 160, 170) : accentC))
                 g.FillEllipse(kb, kx - knobR, cy - knobR, knobR * 2, knobR * 2);
             if (!embedded)
                 using (var kw = new SolidBrush(Ui.Bg)) g.FillEllipse(kw, kx - 2, cy - 2, 4, 4);
 
             // 百分比
             string pctText = volume < 0 ? "--" : pctShown + "%";
-            using (var b = new SolidBrush(dimC))
             using (var sf = new StringFormat { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Center, FormatFlags = StringFormatFlags.NoWrap })
-                g.DrawString(pctText, fontSmall, b, new RectangleF(RPct.X, RPct.Y, RPct.Width, RPct.Height), sf);
+            {
+                var rectPct = new RectangleF(RPct.X, RPct.Y, RPct.Width, RPct.Height);
+                if (transparent) DrawShadowedText(g, pctText, fontSmall, dimC, shadowC, rectPct, sf);
+                else using (var b = new SolidBrush(dimC)) g.DrawString(pctText, fontSmall, b, rectPct, sf);
+            }
+        }
+
+        // 8 方向描边：白字在浅色任务栏上也清清楚楚（像视频字幕那种效果）
+        void DrawShadowedText(Graphics g, string text, Font font, Color color, Color shadow, RectangleF rect, StringFormat sf)
+        {
+            using (var sh = new SolidBrush(shadow))
+            {
+                for (int dx = -1; dx <= 1; dx++)
+                    for (int dy = -1; dy <= 1; dy++)
+                    {
+                        if (dx == 0 && dy == 0) continue;
+                        var r = rect; r.Offset(dx, dy);
+                        g.DrawString(text, font, sh, r, sf);
+                    }
+            }
+            using (var b = new SolidBrush(color)) g.DrawString(text, font, b, rect, sf);
         }
 
         // ---------------- 鼠标 ----------------
@@ -930,7 +1066,7 @@ namespace SideTray
             ComputeLayout();
             Bounds = floatBounds;
             TopMost = cfg.TopMost;
-            using (var p = Ui.Round(new Rectangle(0, 0, Width, Height), 13)) Region = new Region(p);
+            Region = null;
             Invalidate();
         }
 
@@ -1071,8 +1207,9 @@ namespace SideTray
                     var c = bmp.GetPixel(0, 0);
                     if (Math.Abs(c.R - barBg.R) > 40 || Math.Abs(c.G - barBg.G) > 40 || Math.Abs(c.B - barBg.B) > 40)
                     {
-                        Log.W("BG 偏差过大，重采: " + barBg.R + "," + barBg.G + "," + barBg.B + " -> " + c.R + "," + c.G + "," + c.B);
-                        ResampleBg();
+                        Log.W("BG 偏差过大: " + barBg.R + "," + barBg.G + "," + barBg.B + " -> " + c.R + "," + c.G + "," + c.B);
+                        SetLookFromColor(c);
+                        if (!layeredOk) ResampleBg(); else Invalidate();
                     }
                 }
             }
@@ -1174,7 +1311,8 @@ namespace SideTray
 
             var resample = new ToolStripMenuItem("重新采样背景（换主题/壁纸后用）");
             resample.Click += (s, e) => { if (embedded) ResampleBg(); else { /* 浮动模式没有底图 */ } };
-            resample.Enabled = embedded;
+            resample.Enabled = embedded && !layeredOk;
+            resample.Visible = !layeredOk;
             menu.Items.Add(resample);
 
             var toggle = new ToolStripMenuItem("隐藏面板") { ShortcutKeyDisplayString = "Ctrl+Alt+A" };
@@ -1283,6 +1421,7 @@ namespace SideTray
             Native.RegisterHotKey(Handle, HOTKEY_TOGGLE, Native.MOD_CONTROL | Native.MOD_ALT, (uint)Keys.A);
             Native.RegisterHotKey(Handle, HOTKEY_CYCLE, Native.MOD_CONTROL | Native.MOD_ALT, (uint)Keys.V);
             Native.RegisterHotKey(Handle, HOTKEY_MODE, Native.MOD_CONTROL | Native.MOD_ALT, (uint)Keys.B);
+            Native.RegisterHotKey(Handle, HOTKEY_SNAP, Native.MOD_CONTROL | Native.MOD_ALT, (uint)Keys.S);
         }
 
         protected override void OnFormClosed(FormClosedEventArgs e)
@@ -1290,6 +1429,7 @@ namespace SideTray
             Native.UnregisterHotKey(Handle, HOTKEY_TOGGLE);
             Native.UnregisterHotKey(Handle, HOTKEY_CYCLE);
             Native.UnregisterHotKey(Handle, HOTKEY_MODE);
+            Native.UnregisterHotKey(Handle, HOTKEY_SNAP);
             base.OnFormClosed(e);
         }
 
@@ -1302,6 +1442,7 @@ namespace SideTray
                 if (id == HOTKEY_TOGGLE) ToggleVisible();
                 else if (id == HOTKEY_CYCLE) CycleDevice();
                 else if (id == HOTKEY_MODE) SetMode(embedded ? "float" : "taskbar");
+                else if (id == HOTKEY_SNAP) SaveSnapshot();
                 return;
             }
             base.WndProc(ref m);
@@ -1401,6 +1542,28 @@ namespace SideTray
         [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
         [DllImport("user32.dll")] public static extern bool ScreenToClient(IntPtr h, ref Point p);
         [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref Point p);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SIZE { public int cx; public int cy; }
+
+        [StructLayout(LayoutKind.Sequential, Pack = 1)]
+        public struct BLENDFUNCTION
+        {
+            public byte BlendOp;
+            public byte BlendFlags;
+            public byte SourceConstantAlpha;
+            public byte AlphaFormat;
+        }
+
+        [DllImport("user32.dll")] public static extern IntPtr GetDC(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+        [DllImport("gdi32.dll")] public static extern IntPtr CreateCompatibleDC(IntPtr hdc);
+        [DllImport("gdi32.dll")] public static extern bool DeleteDC(IntPtr hdc);
+        [DllImport("gdi32.dll")] public static extern IntPtr SelectObject(IntPtr hdc, IntPtr h);
+        [DllImport("gdi32.dll")] public static extern bool DeleteObject(IntPtr hObject);
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst, IntPtr pptDst, ref SIZE psize,
+            IntPtr hdcSrc, ref Point pptSrc, int crKey, ref BLENDFUNCTION pblend, int dwFlags);
         [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr h);
         [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr h, int id, uint mod, uint vk);
         [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr h, int id);
