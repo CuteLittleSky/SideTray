@@ -63,6 +63,7 @@ namespace SideTray
         public string Mode = "taskbar";   // taskbar | float
         public bool ShrinkTaskList = false;
         public bool SwitchInput = true;                 // 切输出时一起切麦克风
+        public string TextMode = "auto";                 // auto | light | dark（light=浅底用黑字）
         public string BgColor = "";                      // 上次采到的任务栏颜色 "r,g,b"，冷启动兜底
         public List<string[]> Pairs = new List<string[]>();  // 手动配对：{输出名/ID, 输入名/ID}
 
@@ -97,6 +98,7 @@ namespace SideTray
                         case "shrink": c.ShrinkTaskList = v != "0"; break;
                         case "switchinput": c.SwitchInput = v != "0"; break;
                         case "bgcolor": c.BgColor = v; break;
+                        case "textmode": if (v == "auto" || v == "light" || v == "dark") c.TextMode = v; break;
                         case "pair":
                             {
                                 var parts = v.Split('|');
@@ -124,6 +126,8 @@ namespace SideTray
                 sb.AppendLine("shrink=" + (ShrinkTaskList ? "1" : "0"));
                 sb.AppendLine("# switchinput: 1 = 切换输出设备时把麦克风也切到配对的设备");
                 sb.AppendLine("switchinput=" + (SwitchInput ? "1" : "0"));
+                sb.AppendLine("# textmode: auto = 按任务栏明暗自动换（浅底黑字/深底白字）, light = 固定黑字, dark = 固定白字");
+                sb.AppendLine("textmode=" + TextMode);
                 if (!string.IsNullOrEmpty(BgColor)) sb.AppendLine("bgcolor=" + BgColor);
                 foreach (var pr in Pairs) sb.AppendLine("pair=" + pr[0] + "|" + pr[1]);
                 sb.AppendLine("x=" + X);
@@ -759,10 +763,11 @@ namespace SideTray
         {
             // 嵌入任务栏时用「白字 + 深色描边」：不管任务栏是浅色、深色还是壁纸透出来的，
             // 都能看清；也因此完全不依赖截屏取色（截屏在某些远程/多屏环境下拿到的是别的画面）
-            var textC = embedded ? Color.White : Ui.Text;
-            var dimC = embedded ? Color.FromArgb(232, 232, 240) : Ui.Dim;
-            var accentC = embedded ? Color.FromArgb(126, 200, 255) : Ui.Accent;
-            var shadowC = Color.FromArgb(175, 0, 0, 0);
+            var textC = embedded ? barText : Ui.Text;
+            var dimC = embedded ? barDim : Ui.Dim;
+            var accentC = embedded ? barAccent : Ui.Accent;
+            // 深底白字描黑边、浅底黑字描白边，两种都能看清
+            var shadowC = bgLight ? Color.FromArgb(200, 255, 255, 255) : Color.FromArgb(185, 0, 0, 0);
             var fontMain = embedded ? Ui.FontCompact : Ui.FontMain;
             var fontSmall = embedded ? Ui.FontTiny : Ui.FontSmall;
 
@@ -825,7 +830,7 @@ namespace SideTray
             if (transparent)
             {
                 // 深浅两层，保证在任何壁纸/任务栏颜色上都看得见
-                using (var under = new Pen(Color.FromArgb(80, 0, 0, 0), thick + 2.5f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                using (var under = new Pen(bgLight ? Color.FromArgb(70, 255, 255, 255) : Color.FromArgb(85, 0, 0, 0), thick + 2.5f) { StartCap = LineCap.Round, EndCap = LineCap.Round })
                     g.DrawLine(under, tl, cy, tr, cy);
                 using (var baseTrack = new Pen(Color.FromArgb(225, dimC), thick) { StartCap = LineCap.Round, EndCap = LineCap.Round })
                     g.DrawLine(baseTrack, tl, cy, tr, cy);
@@ -1218,20 +1223,35 @@ namespace SideTray
             return true;
         }
 
+        bool bgLight = true;
+
+        void SetTextColors(bool light)
+        {
+            bgLight = light;
+            barText = light ? Color.FromArgb(22, 22, 26) : Color.FromArgb(242, 242, 248);
+            barDim = light ? Color.FromArgb(64, 64, 72) : Color.FromArgb(214, 214, 224);
+            barAccent = light ? Color.FromArgb(0, 90, 184) : Color.FromArgb(126, 200, 255);
+        }
+
         void SetLookFromColor(Color avg)
         {
             barBg = avg;
-            bool light = avg.GetBrightness() > 0.6f;
-            barText = light ? Color.FromArgb(28, 28, 32) : Color.FromArgb(236, 236, 242);
-            barDim = light ? Color.FromArgb(96, 96, 104) : Color.FromArgb(152, 152, 164);
-            barAccent = light ? Color.FromArgb(0, 96, 190) : Color.FromArgb(96, 176, 255);
+            SetTextColors(avg.GetBrightness() > 0.6f);
+            ApplyTextMode();
+        }
+
+        // 用户在菜单里选了「固定黑字 / 固定白字」时，覆盖自动判断
+        void ApplyTextMode()
+        {
+            if (cfg.TextMode == "light") SetTextColors(true);
+            else if (cfg.TextMode == "dark") SetTextColors(false);
         }
 
         void ApplySavedColors()
         {
             try
             {
-                if (string.IsNullOrWhiteSpace(cfg.BgColor)) { barBg = Ui.Bg; barText = Ui.Text; barDim = Ui.Dim; barAccent = Ui.Accent; return; }
+                if (string.IsNullOrWhiteSpace(cfg.BgColor)) { barBg = Ui.Bg; SetTextColors(false); ApplyTextMode(); return; }
                 var parts = cfg.BgColor.Split(',');
                 SetLookFromColor(Color.FromArgb(int.Parse(parts[0]), int.Parse(parts[1]), int.Parse(parts[2])));
             }
@@ -1248,6 +1268,35 @@ namespace SideTray
             Native.ClientToScreen(tbHost, ref p0);
             CaptureTaskbarBg(tbRect, p0.X, p0.Y, false);
             Invalidate();
+        }
+
+        // 分层模式下只采样 1 个像素，用来判断底色是亮是暗（决定黑字还是白字）
+        void SampleBgOnly()
+        {
+            if (!embedded || tbTaskbar == IntPtr.Zero || tbHost == IntPtr.Zero) return;
+            try
+            {
+                Native.RECT tbRect;
+                Native.GetWindowRect(tbTaskbar, out tbRect);
+                var p0 = new Point(lastPlaced.X, lastPlaced.Y);
+                Native.ClientToScreen(tbHost, ref p0);
+                using (var bmp = new Bitmap(1, 1))
+                {
+                    using (var g = Graphics.FromImage(bmp))
+                        g.CopyFromScreen(p0.X + EW / 2, tbRect.Top + 5, 0, 0, new Size(1, 1));
+                    var c = bmp.GetPixel(0, 0);
+                    bool light = c.GetBrightness() > 0.6f;
+                    if (light != bgLight)
+                    {
+                        Log.W("TEXT 底色变化 -> " + (light ? "浅色(黑字)" : "深色(白字)"));
+                        barBg = c;
+                        SetTextColors(light);
+                        ApplyTextMode();
+                        UpdateNow();
+                    }
+                }
+            }
+            catch { }
         }
 
         // 每 60 秒核对任务栏实际颜色，偏差大就重采（换主题 / 换壁纸后自愈）
@@ -1351,6 +1400,18 @@ namespace SideTray
             var micDdm = micMenu.DropDown as ToolStripDropDownMenu;
             if (micDdm != null) micDdm.ShowImageMargin = true;
             menu.Items.Add(micMenu);
+
+            var colorMenu = new ToolStripMenuItem("文字颜色");
+            Action<string, string> addColor = (mode, label) =>
+            {
+                var it = new ToolStripMenuItem(label) { Checked = cfg.TextMode == mode };
+                it.Click += (s, e) => { cfg.TextMode = mode; cfg.Save(); ApplyTextMode(); UpdateNow(); };
+                colorMenu.DropDownItems.Add(it);
+            };
+            addColor("auto", "自动（按任务栏明暗）");
+            addColor("light", "黑字（浅色任务栏）");
+            addColor("dark", "白字（深色任务栏）");
+            menu.Items.Add(colorMenu);
 
             var linkMic = new ToolStripMenuItem("切输出时同时切麦克风") { Checked = cfg.SwitchInput, CheckOnClick = true };
             linkMic.CheckedChanged += (s, e) => { cfg.SwitchInput = linkMic.Checked; cfg.Save(); };
