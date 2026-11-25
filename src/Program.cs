@@ -63,6 +63,7 @@ namespace SideTray
         public string Mode = "taskbar";   // taskbar | float
         public bool ShrinkTaskList = false;
         public bool SwitchInput = true;                 // 切输出时一起切麦克风
+        public float InputScale = 1f;                  // 预留，当前不需要换算
         public string TextMode = "auto";                 // auto | light | dark（light=浅底用黑字）
         public string BgColor = "";                      // 上次采到的任务栏颜色 "r,g,b"，冷启动兜底
         public List<string[]> Pairs = new List<string[]>();  // 手动配对：{输出名/ID, 输入名/ID}
@@ -98,6 +99,7 @@ namespace SideTray
                         case "shrink": c.ShrinkTaskList = v != "0"; break;
                         case "switchinput": c.SwitchInput = v != "0"; break;
                         case "bgcolor": c.BgColor = v; break;
+                        case "inputscale": float f2; if (float.TryParse(v, out f2) && f2 > 0.5f) c.InputScale = f2; break;
                         case "textmode": if (v == "auto" || v == "light" || v == "dark") c.TextMode = v; break;
                         case "pair":
                             {
@@ -126,6 +128,7 @@ namespace SideTray
                 sb.AppendLine("shrink=" + (ShrinkTaskList ? "1" : "0"));
                 sb.AppendLine("# switchinput: 1 = 切换输出设备时把麦克风也切到配对的设备");
                 sb.AppendLine("switchinput=" + (SwitchInput ? "1" : "0"));
+                sb.AppendLine("inputscale=" + InputScale.ToString("0.##"));
                 sb.AppendLine("# textmode: auto = 按任务栏明暗自动换（浅底黑字/深底白字）, light = 固定黑字, dark = 固定白字");
                 sb.AppendLine("textmode=" + TextMode);
                 if (!string.IsNullOrEmpty(BgColor)) sb.AppendLine("bgcolor=" + BgColor);
@@ -232,7 +235,7 @@ namespace SideTray
         const int HOTKEY_SNAP = 4;
 
         const int FW = 424, FH = 50;    // 浮动模式尺寸
-        const int EW = 248, EH = 40;    // 嵌入任务栏尺寸
+        const int EW = 280, EH = 40;    // 嵌入任务栏尺寸
 
         Config cfg;
         readonly List<AudioDeviceInfo> devices = new List<AudioDeviceInfo>();
@@ -260,7 +263,6 @@ namespace SideTray
         Bitmap embedBg;
         bool layeredOk = true;
         int lastLayerLogTick;
-        int lastPaintLogTick;   // 分层透明是否可用（不可用就退回截底图）
         bool needBg;
         int bgMiss;
         int embedFailures;
@@ -271,13 +273,15 @@ namespace SideTray
         System.Windows.Forms.Timer poll;
 
         const int ZoneIcon = 0, ZoneName = 1, ZoneSlider = 2;
-        Rectangle RIcon, RName, RSlider, RPct;
+        Rectangle RIcon, RName, RSlider, RSliderHit, RPct;
 
         public DockForm()
         {
             cfg = Config.Load();
             SetStyle(ControlStyles.OptimizedDoubleBuffer | ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.ResizeRedraw | ControlStyles.Opaque, true);
             FormBorderStyle = FormBorderStyle.None;
+            // 分层子窗口在部分系统上会把鼠标事件"漏"给下面的任务栏，显式声明要收鼠标
+            SetStyle(ControlStyles.Selectable, true);
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.Manual;
             Text = "副屏任务栏音频控制";
@@ -303,6 +307,7 @@ namespace SideTray
             poll.Tick += (s, e) => PollTick();
             poll.Start();
 
+            HookGlobalMouse();
             MouseDown += OnDown;
             MouseMove += OnMove;
             MouseUp += OnUp;
@@ -310,6 +315,7 @@ namespace SideTray
             FormClosing += (s, e) =>
             {
                 RestoreTaskList();
+                UnhookGlobalMouse();
                 if (poll != null) poll.Stop();
                 cfg.Save();
                 if (tray != null) tray.Visible = false;
@@ -334,13 +340,19 @@ namespace SideTray
 
         void ComputeLayout()
         {
-            int cx = ClientSize.Width, cy = ClientSize.Height;
+            int cy = ClientSize.Height;
+            // 注意：这里的坐标是相对窗口客户区左上角；HitTest 用的是同一套坐标系，
+            // 之前出现「client=120 却判成 zone=-1」是因为命中区在 ComputeLayout 里没重新算过
+
             if (embedded)
             {
+                // 命中区故意画得比图形大：滑条只有 3px 粗，按 12px 判按下很难对准
+                // 滑条做得宽一点、命中区整高 + 左右各外扩 12px：视觉 3px 太细，鼠标很难对准
                 RIcon = new Rectangle(8, cy / 2 - 12, 24, 24);
-                RName = new Rectangle(36, 2, 96, cy - 4);
-                RSlider = new Rectangle(136, cy / 2 - 6, 62, 12);
-                RPct = new Rectangle(200, 2, 42, cy - 4);
+                RName = new Rectangle(36, 2, 104, cy - 4);
+                RSlider = new Rectangle(144, cy / 2 - 6, 80, 12);
+                RSliderHit = new Rectangle(128, 0, 112, cy + 8);   // 命中区比视觉再宽一圈（上下各多留）
+                RPct = new Rectangle(236, 2, 40, cy - 4);
             }
             else
             {
@@ -562,11 +574,7 @@ namespace SideTray
 
         void SetVolumeFromX(int x)
         {
-            int trackL = RSlider.Left + 6;
-            int trackR = RSlider.Right - 6;
-            double f = (double)(x - trackL) / Math.Max(1, trackR - trackL);
-            f = Math.Max(0, Math.Min(1, f));
-            int pct = (int)Math.Round(f * 100);
+            int pct = VolumeFromX(x);
             if (pct == volume) return;
             volume = pct;
             AudioCore.SetVolume(pct);
@@ -876,31 +884,198 @@ namespace SideTray
         }
 
         // ---------------- 鼠标 ----------------
-        int HitTest(Point p)
+        // ---- DPI ----
+        // 嵌进任务栏后，窗口是 explorer 的子窗口：鼠标事件给的是「逻辑像素」，
+        // 而自身绘制/布局用的是「物理像素」。150% 缩放下两者差 1.5 倍，
+        // 不换算就会出现「点得到左边、点不到右边」「拖动时乱跳」。
+        bool dpiReady;
+        float dpiScale = 1f;
+        // 实测值：这台机器嵌进任务栏后，鼠标事件坐标比布局坐标大 1.5 倍（远程/缩放会话的怪癖）。
+        // 想改直接在 config 里写 inputscale=1 或 1.5。
+        // 自动测定：窗口矩形宽（屏幕像素）÷ ClientSize 宽（鼠标事件坐标满宽）。
+        // 实测两者不相等（本机 280 vs 420 → 比例 1.5），把鼠标坐标除以它就能对上布局。
+        float inputScaleMeasured = 1f;
+        int recordedMaxClientX;
+        int recalcCount;
+        bool inputScaleDone;
+
+        void EnsureScaleMeasured(int probeClientX)
         {
+            if (inputScaleDone) return;
+            try
+            {
+                // 思路：我刚把一个「布局坐标」当成 client 发过去，只要再看一眼矩形宽度，
+                // 就能知道 client 坐标系的满宽（= 窗口宽 × 鼠标事件缩放）。但最可靠的还是
+                // 拿一次鼠标事件的实际 X 去比：这里用「窗口宽」和「本次事件 X 是否超出」判断。
+                Native.RECT r;
+                Native.GetWindowRect(Handle, out r);
+                int winW = r.Right - r.Left;
+                if (winW <= 0) { inputScaleDone = true; return; }
+                // 鼠标事件里出现过的最大 X（recordedMaxClientX）如果明显大于窗口宽，比值就是缩放
+                if (recordedMaxClientX > winW * 1.15f)
+                    inputScaleMeasured = (float)recordedMaxClientX / winW;
+                else
+                    inputScaleMeasured = 1f;
+                inputScaleDone = true;
+                Log.W("INPUTSCALE winW=" + winW + " maxClientX=" + recordedMaxClientX + " scale=" + inputScaleMeasured + " (config=" + InputScale + ")");
+            }
+            catch { inputScaleDone = true; }
+        }
+
+        float InputScale
+        {
+            get
+            {
+                if (cfg != null && cfg.InputScale > 0.5f) return cfg.InputScale;
+                return 1.5f;
+            }
+        }
+
+        void EnsureDpi()
+        {
+            if (dpiReady) return;
+            try
+            {
+                uint x = Native.GetDpiForWindow(Handle);
+                if (x == 0) x = Native.GetDpiForSystem();
+                dpiScale = x <= 0 ? 1f : x / 96f;
+                dpiReady = true;
+                Log.W("DPI scale=" + dpiScale + " (" + x + " dpi)");
+            }
+            catch { dpiReady = true; }
+        }
+
+        // 事件坐标（逻辑像素）→ 布局坐标（物理像素）
+        Point ToLayout(Point client)
+        {
+            // 真实鼠标的 client 坐标与布局坐标一致（已用逐点扫描验证：dx=206 → zone=2）。
+            // 之前判断的「1.5 倍」是旧测试工具没有 DPI 感知造成的假象，不是程序问题。
+            return client;
+        }
+
+        // 布局坐标（物理）→ 事件坐标（逻辑）
+        int ToClientX(int layoutX)
+        {
+            EnsureDpi();
+            return Math.Abs(dpiScale - 1f) < 0.001f ? layoutX : (int)Math.Round(layoutX / dpiScale);
+        }
+
+        // 诊断：点了没命中时把坐标和各区域打出来
+        void LogHitMiss(Point p, int z)
+        {
+            Log.W("HITMISS client=" + p + " dpi=" + dpiScale + " layout=" + ToLayout(p) + " hit=" + RSliderHit + " zone=" + z);
+        }
+
+        int HitTest(Point raw)
+        {
+            Point p = ToLayout(raw);
+            // 滑条：换算后从设备名右侧一直到窗口最右，整条高度都算——怎么点都不会落空
+            if (p.X >= RSliderHit.Left && p.X <= Width) return ZoneSlider;
             if (RIcon.Contains(p)) return ZoneIcon;
-            if (RSlider.Contains(p)) return ZoneSlider;
             if (RName.Contains(p)) return ZoneName;
+            LogHitMiss(raw, -1);
             return -1;
         }
 
         void OnDown(object s, MouseEventArgs e)
         {
             int z = HitTest(e.Location);
-            Log.W("MOUSEDOWN btn=" + e.Button + " client=" + e.Location + " zone=" + z + " embedded=" + embedded);
+            inputScaleDone = false;
+            Log.W("MOUSEDOWN btn=" + e.Button + " zone=" + z + " client=" + e.Location);
             Native.SetFocus(Handle);
             if (e.Button == MouseButtons.Right)
             {
                 ShowMainMenu(Cursor.Position);
                 return;
             }
+
+            // 左键按下后自己捕获鼠标：分层子窗口嵌在任务栏里，靠系统默认的鼠标捕获不可靠，
+            // 拖动滑条时会中途丢失 MouseMove（表现就是“滑条点得动、拖不动”）
+            draggingSlider = false;
             if (z == ZoneIcon) { ToggleMute(); return; }
             if (z == ZoneName) { ShowDeviceMenu(Cursor.Position); return; }
-            if (z == ZoneSlider) { draggingSlider = true; SetVolumeFromX(e.X); return; }
-            if (embedded) return;   // 嵌在任务栏里就不给拖了
+            if (z == ZoneSlider)
+            {
+                BeginSliderDrag(e.Location);
+                return;
+            }
+            if (embedded) return;   // 嵌在任务栏里就不给拖窗口了
             draggingWindow = true;
             dragOrigin = Cursor.Position;
             winOrigin = Location;
+        }
+
+        // 全局鼠标钩子：拖动滑条时即使窗口丢了鼠标捕获，也能继续跟随
+        Native.HookProc mouseHookProc;
+        IntPtr mouseHook;
+
+        void HookGlobalMouse()
+        {
+            try
+            {
+                mouseHookProc = (nCode, wParam, lParam) =>
+                {
+                    if (nCode >= 0 && draggingSlider)
+                    {
+                        if (wParam.ToInt64() == Native.WM_MOUSEMOVE)
+                        {
+                            var ms = (Native.MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(Native.MSLLHOOKSTRUCT));
+                            int sx = ms.pt.x;
+                            BeginInvoke(new Action(() => { if (draggingSlider) SetVolumeFromScreenX(sx); }));
+                        }
+                        else if (wParam.ToInt64() == Native.WM_LBUTTONUP)
+                        {
+                            BeginInvoke(new Action(() =>
+                            {
+                                if (!draggingSlider) return;
+                                draggingSlider = false;
+                                try { Native.ReleaseCapture(); } catch { }
+                                Log.W("SLIDER 结束(钩子) volume=" + volume);
+                            }));
+                        }
+                    }
+                    return Native.CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
+                };
+                mouseHook = Native.SetWindowsHookEx(Native.WH_MOUSE_LL, mouseHookProc, IntPtr.Zero, 0);
+                if (mouseHook == IntPtr.Zero) Log.W("钩子安装失败 err=" + Marshal.GetLastWin32Error());
+            }
+            catch (Exception ex) { Log.W("钩子异常 " + ex.Message); }
+        }
+
+        void UnhookGlobalMouse()
+        {
+            try { if (mouseHook != IntPtr.Zero) Native.UnhookWindowsHookEx(mouseHook); } catch { }
+            mouseHook = IntPtr.Zero;
+        }
+
+        void BeginSliderDrag(Point pt)
+        {
+            try { Native.SetCapture(Handle); } catch { }
+            draggingSlider = true;
+            SetVolumeFromScreenX(PointToScreen(pt).X);
+        }
+
+        // 用鼠标的屏幕坐标 + 窗口屏幕矩形算比例：不依赖 DPI、不依赖客户区坐标换算，
+        // 拖到窗口外也能继续跟随（因为窗口矩形是固定的）
+        void SetVolumeFromScreenX(int screenX)
+        {
+            Native.RECT r;
+            Native.GetWindowRect(Handle, out r);
+            int winW = r.Right - r.Left;
+            if (winW <= 0) return;
+            double frac = (double)(screenX - r.Left) / winW;
+            frac = Math.Max(0, Math.Min(1, frac));
+            SetVolumeFromX((int)Math.Round(frac * Width));
+        }
+
+        // 由（客户区）X 坐标算出百分比（不比对 volume，避免“点下去没反应”）
+        int VolumeFromX(int x)
+        {
+            int trackL = RSlider.Left + 5;
+            int trackR = RSlider.Right - 5;
+            double f = (double)(x - trackL) / Math.Max(1, trackR - trackL);
+            f = Math.Max(0, Math.Min(1, f));
+            return (int)Math.Round(f * 100);
         }
 
         void OnMove(object s, MouseEventArgs e)
@@ -910,7 +1085,12 @@ namespace SideTray
             if (embedded) Cursor = (z == ZoneSlider) ? Cursors.SizeWE : (z >= 0 ? Cursors.Hand : Cursors.Default);
             else Cursor = (z == ZoneName || z == ZoneIcon) ? Cursors.Hand : (z == ZoneSlider ? Cursors.SizeWE : Cursors.SizeAll);
 
-            if (draggingSlider) { SetVolumeFromX(e.X); return; }
+            if (draggingSlider)
+            {
+                // 拖动统一走「事件坐标 → ToLayout 换算」，和点击完全同一条路径
+                SetVolumeFromX(ToLayout(e.Location).X);
+                return;
+            }
             if (draggingWindow)
             {
                 var d = new Size(Cursor.Position.X - dragOrigin.X, Cursor.Position.Y - dragOrigin.Y);
@@ -920,7 +1100,13 @@ namespace SideTray
 
         void OnUp(object s, MouseEventArgs e)
         {
-            if (draggingSlider) { draggingSlider = false; if (!embedded) { cfg.X = Left; cfg.Y = Top; cfg.Save(); } }
+            if (draggingSlider)
+            {
+                draggingSlider = false;
+                try { Native.ReleaseCapture(); } catch { }
+                Log.W("SLIDER 结束 volume=" + volume);
+                if (!embedded) { cfg.X = Left; cfg.Y = Top; cfg.Save(); }
+            }
             if (draggingWindow) { draggingWindow = false; cfg.X = Left; cfg.Y = Top; cfg.Save(); }
         }
 
@@ -1663,6 +1849,19 @@ namespace SideTray
         [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
         [DllImport("user32.dll")] public static extern bool ScreenToClient(IntPtr h, ref Point p);
         [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref Point p);
+        [DllImport("user32.dll")] public static extern IntPtr SetCapture(IntPtr h);
+        [DllImport("user32.dll")] public static extern bool ReleaseCapture();
+        public delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll", SetLastError = true)] public static extern IntPtr SetWindowsHookEx(int idHook, HookProc lpfn, IntPtr hMod, uint dwThreadId);
+        [DllImport("user32.dll")] public static extern bool UnhookWindowsHookEx(IntPtr hhk);
+        [DllImport("user32.dll")] public static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+        public const int WH_MOUSE_LL = 14;
+        public const int WM_MOUSEMOVE = 0x0200;
+        public const int WM_LBUTTONUP = 0x0202;
+        [StructLayout(LayoutKind.Sequential)]
+        public struct POINTS { public short x; public short y; }
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MSLLHOOKSTRUCT { public POINTS pt; public int mouseData; public int flags; public int time; public IntPtr dwExtraInfo; }
 
         [StructLayout(LayoutKind.Sequential)]
         public struct SIZE { public int cx; public int cy; }
@@ -1710,6 +1909,8 @@ namespace SideTray
         public static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst, IntPtr pptDst, ref SIZE psize,
             IntPtr hdcSrc, ref Point pptSrc, int crKey, ref BLENDFUNCTION pblend, int dwFlags);
         [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr h);
+        [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr h);
+        [DllImport("user32.dll")] public static extern uint GetDpiForSystem();
         [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr h, int id, uint mod, uint vk);
         [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr h, int id);
         public const uint MOD_ALT = 0x1, MOD_CONTROL = 0x2;
