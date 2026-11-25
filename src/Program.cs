@@ -892,45 +892,6 @@ namespace SideTray
         float dpiScale = 1f;
         // 实测值：这台机器嵌进任务栏后，鼠标事件坐标比布局坐标大 1.5 倍（远程/缩放会话的怪癖）。
         // 想改直接在 config 里写 inputscale=1 或 1.5。
-        // 自动测定：窗口矩形宽（屏幕像素）÷ ClientSize 宽（鼠标事件坐标满宽）。
-        // 实测两者不相等（本机 280 vs 420 → 比例 1.5），把鼠标坐标除以它就能对上布局。
-        float inputScaleMeasured = 1f;
-        int recordedMaxClientX;
-        int recalcCount;
-        bool inputScaleDone;
-
-        void EnsureScaleMeasured(int probeClientX)
-        {
-            if (inputScaleDone) return;
-            try
-            {
-                // 思路：我刚把一个「布局坐标」当成 client 发过去，只要再看一眼矩形宽度，
-                // 就能知道 client 坐标系的满宽（= 窗口宽 × 鼠标事件缩放）。但最可靠的还是
-                // 拿一次鼠标事件的实际 X 去比：这里用「窗口宽」和「本次事件 X 是否超出」判断。
-                Native.RECT r;
-                Native.GetWindowRect(Handle, out r);
-                int winW = r.Right - r.Left;
-                if (winW <= 0) { inputScaleDone = true; return; }
-                // 鼠标事件里出现过的最大 X（recordedMaxClientX）如果明显大于窗口宽，比值就是缩放
-                if (recordedMaxClientX > winW * 1.15f)
-                    inputScaleMeasured = (float)recordedMaxClientX / winW;
-                else
-                    inputScaleMeasured = 1f;
-                inputScaleDone = true;
-                Log.W("INPUTSCALE winW=" + winW + " maxClientX=" + recordedMaxClientX + " scale=" + inputScaleMeasured + " (config=" + InputScale + ")");
-            }
-            catch { inputScaleDone = true; }
-        }
-
-        float InputScale
-        {
-            get
-            {
-                if (cfg != null && cfg.InputScale > 0.5f) return cfg.InputScale;
-                return 1.5f;
-            }
-        }
-
         void EnsureDpi()
         {
             if (dpiReady) return;
@@ -980,7 +941,6 @@ namespace SideTray
         void OnDown(object s, MouseEventArgs e)
         {
             int z = HitTest(e.Location);
-            inputScaleDone = false;
             Log.W("MOUSEDOWN btn=" + e.Button + " zone=" + z + " client=" + e.Location);
             Native.SetFocus(Handle);
             if (e.Button == MouseButtons.Right)
@@ -1015,24 +975,19 @@ namespace SideTray
             {
                 mouseHookProc = (nCode, wParam, lParam) =>
                 {
-                    if (nCode >= 0 && draggingSlider)
+                    // 拖动中：只做「移动 → 更新音量」。
+                    // 不在这里处理抬起——之前那样做会把按下瞬间的杂散消息当成抬起，
+                    // 导致一按下就"结束拖动"，表现就是拉不动。
+                    if (nCode >= 0 && draggingSlider && wParam.ToInt64() == Native.WM_MOUSEMOVE)
                     {
-                        if (wParam.ToInt64() == Native.WM_MOUSEMOVE)
-                        {
-                            var ms = (Native.MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(Native.MSLLHOOKSTRUCT));
-                            int sx = ms.pt.x;
+                        var ms = (Native.MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(Native.MSLLHOOKSTRUCT));
+                        int sx = ms.pt.x;
+                        // 只有左键仍按着才继续（GetAsyncKeyState 最可靠）
+                        bool stillDown = (Native.GetAsyncKeyState(0x01) & 0x8000) != 0;
+                        if (stillDown)
                             BeginInvoke(new Action(() => { if (draggingSlider) SetVolumeFromScreenX(sx); }));
-                        }
-                        else if (wParam.ToInt64() == Native.WM_LBUTTONUP)
-                        {
-                            BeginInvoke(new Action(() =>
-                            {
-                                if (!draggingSlider) return;
-                                draggingSlider = false;
-                                try { Native.ReleaseCapture(); } catch { }
-                                Log.W("SLIDER 结束(钩子) volume=" + volume);
-                            }));
-                        }
+                        else
+                            BeginInvoke(new Action(() => EndSliderDrag("松开(钩子)")));
                     }
                     return Native.CallNextHookEx(IntPtr.Zero, nCode, wParam, lParam);
                 };
@@ -1040,6 +995,14 @@ namespace SideTray
                 if (mouseHook == IntPtr.Zero) Log.W("钩子安装失败 err=" + Marshal.GetLastWin32Error());
             }
             catch (Exception ex) { Log.W("钩子异常 " + ex.Message); }
+        }
+
+        void EndSliderDrag(string why)
+        {
+            if (!draggingSlider) return;
+            draggingSlider = false;
+            try { Native.ReleaseCapture(); } catch { }
+            Log.W("SLIDER 结束(" + why + ") volume=" + volume);
         }
 
         void UnhookGlobalMouse()
@@ -1849,6 +1812,7 @@ namespace SideTray
         [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
         [DllImport("user32.dll")] public static extern bool ScreenToClient(IntPtr h, ref Point p);
         [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref Point p);
+        [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
         [DllImport("user32.dll")] public static extern IntPtr SetCapture(IntPtr h);
         [DllImport("user32.dll")] public static extern bool ReleaseCapture();
         public delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
